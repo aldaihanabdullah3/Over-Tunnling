@@ -5,6 +5,7 @@
 
 import base64
 import socket
+import subprocess
 import threading
 import argparse
 import os
@@ -98,37 +99,11 @@ def write_file(data, file_path, file_name):
         f.write(base64_data)
 
 
-def writing_th(path, tap, EXIT):
-    counter = 0
-    while not EXIT:
-        data = tap.read(1518) #default MTU
-        if not data:
-            if EXIT:
-                break
-            continue
-        print("writing",len(data)," bytes")
-        write_file(data, path, str(counter)+".pp")
-        counter += 1
-        delete_old_files(path, datetime.utcnow() - timedelta(seconds=10))
-
-
 def read_file(file_path, file_name):
     with open(os.path.join(file_path, file_name), 'r') as file:
         base64_data = file.read().strip()
         data = base64.b64decode(base64_data)
         return data
-    
-
-def reading_th(path, tap, EXIT):
-    ti = datetime.utcnow()
-    while not EXIT:
-        for x in list_files_by_date(path, ti):
-            data = read_file(path, x)
-            print("received",len(data)," bytes")
-            tap.write(data)
-            tmp_ti = datetime.fromtimestamp(os.path.getctime(os.path.join(path, x)))
-            if tmp_ti > ti:
-                ti = tmp_ti
 
 
 def list_files_by_date(path, date):
@@ -146,7 +121,36 @@ def delete_old_files(path, date):
                 os.remove(file_path)
 
 
-def main_files():
+def writing_thread(path: str, tap: TunTap, stop: threading.Event):
+    counter = 0
+    while not stop.is_set():
+        data = tap.read(1518) #default MTU
+        if not data:
+            continue
+
+        print("writing", len(data), " bytes")
+        write_file(data, path, str(counter)+".pp")
+        counter += 1
+        delete_old_files(path, datetime.utcnow() - timedelta(seconds=10))
+    
+    print("joining Writing Thread")
+
+
+def reading_thread(path: str, tap: TunTap, stop: threading.Event):
+    ti = datetime.utcnow()
+    while not stop.is_set():
+        for x in list_files_by_date(path, ti):
+            data = read_file(path, x)
+            print("received", len(data), " bytes")
+            tap.write(data)
+            tmp_ti = datetime.fromtimestamp(os.path.getctime(os.path.join(path, x)))
+            if tmp_ti > ti:
+                ti = tmp_ti
+    
+    print("Joining Reading Thread")
+
+
+def main(stop):
     # parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--writepath', type=str, required=True)
@@ -156,15 +160,16 @@ def main_files():
     parser.add_argument('--tapMask', type=str, required=True)
     args = parser.parse_args()
 
-    tap = TunTap(nic_type="Tap", nic_name=args.tap)
-    tap.config(ip=args.tapAddress, mask=args.tapMask)
     readpath = args.readpath
     writepath = args.writepath
+    nic = args.tap
+    tap = TunTap(nic_type="Tap", nic_name=nic)
+    tap.config(ip=args.tapAddress, mask=args.tapMask)
     
     #clear_file(readfile)
     delete_old_files(writepath, datetime.utcnow()) #clear only write path, read path should be cleared by other end
-    thread_read = threading.Thread(target=reading_th, args=(readpath, tap, EXIT))
-    thread_write = threading.Thread(target=writing_th, args=(writepath, tap, EXIT))
+    thread_read = threading.Thread(target=reading_thread, args=(readpath, tap, stop))
+    thread_write = threading.Thread(target=writing_thread, args=(writepath, tap, stop))
     
     # start the threads
     thread_read.start()
@@ -173,14 +178,17 @@ def main_files():
     # wait for the threads to finish
     thread_read.join()
     thread_write.join()
+    tap.close()
+    subprocess.run(['ip', 'link', 'del', 'dev', nic])
 
 
 if __name__ == "__main__":
+    stop_event = threading.Event()
     try:
-        #main_tcp()
-        main_files()
+        main(stop_event)
 
     except KeyboardInterrupt:
         print("Terminating ...")
-        EXIT = True
-        exit()
+        stop_event.set()
+
+    exit()
